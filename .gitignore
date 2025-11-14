@@ -1,0 +1,53 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ===== Virtual environment =====
+.venv/
+venv/
+env/
+
+# ===== OS・エディタ =====
+.DS_Store
+Thumbs.db
+.vscode/
+
+# ===== Data =====
+# 生データは基本的にGitに含めない
+input/*.zip
+input/*.csv
+input/photos/
+input/test.csv
+input/train.csv
+input/materials.csv
+input/techniques.csv
+input/*Zone.Identifier
+
+# 必要なら sample_submission.csv だけ残す
+#!input/atmaCup#11_sample_submission.csv
+
+# ===== Experiments =====
+# 実験結果のログやモデルはGitに含めない
+output/
+experiments/*/__pycache__/
+experiments/*/*.pth
+experiments/*/*.ckpt
+experiments/*/*.log
+
+# config は残す
+!experiments/**/config.yaml
+
+# ===== Checkpoints / Logs =====
+*.log
+*.ckpt
+*.pth
+*.pt
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== Temporary =====
+tmp/
+temp/
