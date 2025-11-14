@@ -183,7 +183,75 @@ def main(cfg: Config) -> None:
     LOGGER.info("test_df  shape: %s", test_df.shape)
     LOGGER.info("train_df columns: %s", list(train_df.columns))
 
-    LOGGER.info("Experiment finished (まだ学習ロジックは未実装です)")
+    # ==============================
+    # Fold 作成 (StratifiedGroupKFold)
+    # ==============================
+    LOGGER.info("Create folds with StratifiedGroupKFold")
+
+    n_splits = 5
+    sgkf = StratifiedGroupKFold(
+        n_splits=n_splits, shuffle=True, random_state=cfg.exp.seed)
+
+    # y: target, groups: art_series_id
+    y = train_df["target"].values
+    groups = train_df["art_series_id"].values
+    fold_indices = np.zeros(len(train_df), dtype=int)
+
+    for fold, (_, val_idx) in enumerate(sgkf.split(train_df, y, groups)):
+        fold_indices[val_idx] = fold
+
+    train_df["fold"] = fold_indices
+
+    LOGGER.info("Fold distribution (by target):")
+    fold_target_counts = train_df.groupby(
+        "fold")["target"].value_counts().unstack().fillna(0)
+    LOGGER.info("\n%s", fold_target_counts)
+
+    # ==============================
+    # Dataset / DataLoader の作成
+    # ==============================
+    photos_dir = input_dir / "photos"
+    LOGGER.info("Photos dir: %s", photos_dir)
+
+    train_tfm, valid_tfm = create_transforms(cfg.exp.img_size)
+
+    # とりあえず 1 つ目の fold を使う（config の exp.folds[0]）
+    target_fold = cfg.exp.folds[0]
+    LOGGER.info("Prepare DataLoader for fold=%d", target_fold)
+
+    df_trn = train_df[train_df["fold"] != target_fold].copy()
+    df_val = train_df[train_df["fold"] == target_fold].copy()
+
+    LOGGER.info("Train size (fold != %d): %d", target_fold, len(df_trn))
+    LOGGER.info("Valid size (fold == %d): %d", target_fold, len(df_val))
+
+    trn_ds = AtmaDataset(meta_df=df_trn, images_root=photos_dir,
+                         transform=train_tfm, is_train=True)
+    val_ds = AtmaDataset(meta_df=df_val, images_root=photos_dir,
+                         transform=valid_tfm, is_train=True)
+
+    trn_loader = DataLoader(
+        trn_ds,
+        batch_size=cfg.exp.batch_size,
+        shuffle=True,
+        num_workers=cfg.exp.num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg.exp.batch_size,
+        shuffle=False,
+        num_workers=cfg.exp.num_workers,
+        pin_memory=True,
+    )
+
+    # 一つバッチを取り出して shape を確認（デバッグ目的）
+    batch = next(iter(trn_loader))
+    imgs, targets = batch
+    LOGGER.info("Sample batch - imgs shape: %s, targets shape: %s",
+                imgs.shape, targets.shape)
+
+    LOGGER.info("Experiment finished (まだ Lightning での学習は未実装です)")
 
 
 if __name__ == "__main__":
