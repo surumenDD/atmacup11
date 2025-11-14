@@ -1,40 +1,40 @@
-# experiments/exp001_resnet18d_reg/run.py
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import Dict, Optional, List
 
 import hydra
 import numpy as np
 import pandas as pd
+import pytorch_lightning as pl
+import timm
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from hydra.core.config_store import ConfigStore
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
-
-import torch
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms as T
 from PIL import Image
-from sklearn.model_selection import StratifiedGroupKFold
-
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
+from sklearn.model_selection import StratifiedGroupKFold
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms as T
+from tqdm.auto import tqdm
 
-import timm
 import wandb
-
-from typing import Dict, Optional
-
 from utils.env import EnvConfig
 from utils.logger import get_logger
 from utils.timing import trace
 
-# ------------------
-# 設定クラス
-# ------------------
+LOGGER = None
+WANDB_PROJECT_NAME = "atmacup11"
 
+
+# ==============================
+# Config 定義
+# ==============================
 
 @dataclass
 class ExpConfig:
@@ -46,8 +46,10 @@ class ExpConfig:
     img_size: int = 224
     num_workers: int = 4
     weight_decay: float = 0.0
-    model_name: str = "resnet18d"
+    # 学習に使う fold
     folds: List[int] = field(default_factory=lambda: [0])
+    # mean/std 計算時にサンプリングする枚数（None なら全件）
+    mean_std_sample_limit: Optional[int] = None
 
 
 @dataclass
@@ -60,12 +62,12 @@ cs = ConfigStore.instance()
 cs.store(name="default", group="env", node=EnvConfig)
 cs.store(name="default", group="exp", node=ExpConfig)
 
-LOGGER = None
 
+# ==============================
+# Utility 関数
+# ==============================
 
 def set_seed(seed: int) -> None:
-    import torch
-
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -74,62 +76,88 @@ def set_seed(seed: int) -> None:
 
 
 def resolve_input_dir(cfg_input_dir: str) -> Path:
-    """
-    Config の input_dir を優先しつつ、
-    なければプロジェクト直下の input/ を探す。
-    """
+    """Kami さん実装と同じような入力ディレクトリ解決ロジック。"""
     cfg_dir = Path(cfg_input_dir)
     if cfg_dir.exists():
         return cfg_dir
-    # run.py から見て 2 つ上がプロジェクトルートの想定
+
     workspace_input = Path(__file__).resolve().parents[2] / "input"
     if workspace_input.exists():
         return workspace_input
-    # 最後の手段: CWD/input
-    return Path.cwd() / "input"
+
+    cwd_input = Path.cwd() / "input"
+    return cwd_input
 
 
-def create_transforms(img_size: int) -> tuple[T.Compose, T.Compose]:
+def compute_channel_mean_std(
+    image_paths: List[Path],
+    img_size: int,
+    sample_limit: Optional[int] = None,
+) -> tuple[List[float], List[float]]:
     """
-    学習用・検証用のデータ変換を返す。
-    まずはシンプルに Resize + Flip + ToTensor のみ。
-    （Normalize や高度な拡張は後で追加する）
+    ノートブックの compute_channel_mean_std を元にした channel-wise mean/std 計算。
     """
-    train_tfm = T.Compose(
-        [
-            T.Resize((img_size, img_size)),
-            T.RandomHorizontalFlip(p=0.5),
-            T.ToTensor(),
-        ]
-    )
-    valid_tfm = T.Compose(
-        [
-            T.Resize((img_size, img_size)),
-            T.ToTensor(),
-        ]
-    )
-    return train_tfm, valid_tfm
+    tfm = T.Compose([
+        T.Resize((img_size, img_size)),
+        T.ToTensor(),  # [0,1] スケール
+    ])
+
+    n = 0
+    csum = torch.zeros(3, dtype=torch.float64)
+    csum_sq = torch.zeros(3, dtype=torch.float64)
+
+    if sample_limit is not None:
+        paths = image_paths[:sample_limit]
+    else:
+        paths = image_paths
+
+    for p in tqdm(paths, desc="Compute mean/std"):
+        try:
+            x = tfm(Image.open(p).convert("RGB"))
+        except Exception:
+            continue
+        num_pix = x.shape[1] * x.shape[2]
+        n += num_pix
+        x_2d = x.reshape(3, -1)
+        csum += x_2d.sum(dim=1).double()
+        csum_sq += (x_2d ** 2).sum(dim=1).double()
+
+    mean = (csum / n).tolist()
+    var = (csum_sq / n - (csum / n) ** 2).tolist()
+    std = [float(np.sqrt(max(v, 0.0))) for v in var]
+    return mean, std
 
 
 class AtmaDataset(Dataset):
     """
-    train/test 共通で使う Dataset。
-    - meta_df: DataFrame。train のときは target 列を含む。
-    - images_root: photos ディレクトリの Path。
-    - is_train: True のときは target を返す。
+    ノートブック版 AtmaDataset を、パス生成と mean/std 正規化込みで実装。
+    object_id からパスを作り、is_train で Augmentation 切り替え。
     """
 
     def __init__(
         self,
         meta_df: pd.DataFrame,
-        images_root: Path,
-        transform: T.Compose,
+        photos_dir: Path,
+        img_size: int,
+        mean: Optional[List[float]],
+        std: Optional[List[float]],
         is_train: bool = True,
     ) -> None:
         self.meta_df = meta_df.reset_index(drop=True)
-        self.images_root = Path(images_root)
-        self.transform = transform
+        self.photos_dir = Path(photos_dir)
+        self.img_size = img_size
         self.is_train = is_train
+        self.mean = mean
+        self.std = std
+
+        tfms: List[torch.nn.Module] = [T.Resize((img_size, img_size))]
+        if is_train:
+            tfms.append(T.RandomHorizontalFlip(p=0.5))
+        tfms.append(T.ToTensor())
+        if self.mean is not None and self.std is not None:
+            tfms.append(T.Normalize(mean=self.mean, std=self.std))
+
+        self.transformer = T.Compose(tfms)
 
     def __len__(self) -> int:
         return len(self.meta_df)
@@ -137,53 +165,56 @@ class AtmaDataset(Dataset):
     def __getitem__(self, idx: int):
         row = self.meta_df.iloc[idx]
         object_id = str(row["object_id"])
-        img_path = self.images_root / f"{object_id}.jpg"
+        img_path = self.photos_dir / f"{object_id}.jpg"
+        img = Image.open(img_path).convert("RGB")
+        img = self.transformer(img)
 
-        # 念のため他拡張子も見る
-        if not img_path.exists():
-            for ext in [".jpeg", ".png"]:
-                alt = self.images_root / f"{object_id}{ext}"
-                if alt.exists():
-                    img_path = alt
-                    break
-
-        with Image.open(img_path) as img:
-            img = img.convert("RGB")
-
-        img = self.transform(img)
-
-        if self.is_train:
-            target = float(row["target"])
-            return img, torch.tensor(target, dtype=torch.float32)
+        if "target" in self.meta_df.columns:
+            label = float(row["target"])
         else:
-            return img, object_id
+            label = -1.0
+
+        return img, torch.tensor(label, dtype=torch.float32)
+
+
+def create_resnet18d_reg(model_name: str = "resnet18d") -> nn.Module:
+    """
+    ノートブックの create_model と同等：
+    - timm の resnet18d
+    - pretrained=False
+    - 出力 1 次元の回帰
+    """
+    model = timm.create_model(
+        model_name,
+        pretrained=False,
+        num_classes=1,  # そのまま 1 出力ヘッド
+        in_chans=3,
+    )
+    return model
 
 
 class RegressionModule(pl.LightningModule):
     """
-    timm の resnet18d を使った回帰モデル（target をそのまま予測）。
-    MSELoss を最小化しつつ、RMSE をログに出す。
+    resnet18d による回帰タスク（RMSE）。
     """
 
-    def __init__(self, model_name: str, learning_rate: float, weight_decay: float) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        learning_rate: float,
+        weight_decay: float,
+    ) -> None:
         super().__init__()
-        self.save_hyperparameters()  # hparams に保存（W&B からも見える）
-
-        # timm モデルをベースに最終層だけ 1 出力に付け替える
-        backbone = timm.create_model(
-            model_name, pretrained=False, num_classes=0, in_chans=3)
-        in_features = backbone.num_features  # resnet18d は 512
-        backbone.fc = nn.Linear(in_features, 1)  # 1 次元の回帰
-
-        self.model = backbone
+        self.save_hyperparameters()
+        self.model = create_resnet18d_reg(model_name=model_name)
         self.loss_fn = nn.MSELoss()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x).view(-1)  # (N,) に揃える
+        return self.model(x).squeeze(1)  # (N, 1) -> (N,)
 
     def training_step(self, batch, batch_idx: int):
-        imgs, targets = batch  # targets: (N,)
-        preds = self(imgs)     # (N,)
+        imgs, targets = batch
+        preds = self(imgs)
         loss = self.loss_fn(preds, targets)
         self.log("train_loss", loss, prog_bar=False,
                  on_step=False, on_epoch=True)
@@ -193,7 +224,7 @@ class RegressionModule(pl.LightningModule):
         imgs, targets = batch
         preds = self(imgs)
         loss = self.loss_fn(preds, targets)
-        rmse = torch.sqrt(torch.mean((preds - targets) ** 2))
+        rmse = torch.sqrt(self.loss_fn(preds, targets))
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         self.log("val_rmse", rmse, prog_bar=True, on_step=False, on_epoch=True)
         return {"val_loss": loss, "val_rmse": rmse}
@@ -201,16 +232,20 @@ class RegressionModule(pl.LightningModule):
     def predict_step(self, batch, batch_idx: int, dataloader_idx: int = 0):
         imgs, _ = batch
         preds = self(imgs)
-        return preds  # (N,)
+        return preds
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
+        optimizer = optim.Adam(
             self.parameters(),
             lr=self.hparams.learning_rate,
             weight_decay=self.hparams.weight_decay,
         )
         return optimizer
 
+
+# ==============================
+# Fold 学習（OOF 付き）
+# ==============================
 
 def train_one_fold(
     fold: int,
@@ -220,17 +255,16 @@ def train_one_fold(
     output_dir: Path,
     accelerator: str,
     devices: Optional[int],
-    train_tfm: T.Compose,
-    valid_tfm: T.Compose,
+    img_mean: List[float],
+    img_std: List[float],
 ) -> tuple[np.ndarray, float, str]:
     """
-    この fold の学習を行い、
-    - df_val に対応する予測ベクトル（OOF用）
-    - fold の RMSE
-    - ベストcheckpointのパス
-    を返す。
+    1 つの fold を学習して:
+      - この fold の valid 行に対応する OOF 予測 (np.ndarray)
+      - fold RMSE
+      - ベスト checkpoint パス
+    を返す（Kami さんの train_one_fold スタイル）。
     """
-    # === fold の分割 ===
     df_trn = train_df[train_df["fold"] != fold].copy()
     df_val = train_df[train_df["fold"] == fold].copy()
 
@@ -239,15 +273,19 @@ def train_one_fold(
 
     trn_ds = AtmaDataset(
         meta_df=df_trn,
-        images_root=photos_dir,
-        transform=train_tfm,
+        photos_dir=photos_dir,
+        img_size=cfg.exp.img_size,
+        mean=img_mean,
+        std=img_std,
         is_train=True,
     )
     val_ds = AtmaDataset(
         meta_df=df_val,
-        images_root=photos_dir,
-        transform=valid_tfm,
-        is_train=True,
+        photos_dir=photos_dir,
+        img_size=cfg.exp.img_size,
+        mean=img_mean,
+        std=img_std,
+        is_train=False,
     )
 
     trn_loader = DataLoader(
@@ -266,7 +304,8 @@ def train_one_fold(
     )
 
     module = RegressionModule(
-        model_name=cfg.exp.model_name,
+        model_name=cfg.exp.model_name if hasattr(
+            cfg.exp, "model_name") else "resnet18d",
         learning_rate=cfg.exp.learning_rate,
         weight_decay=cfg.exp.weight_decay,
     )
@@ -288,8 +327,8 @@ def train_one_fold(
         os.environ["WANDB_MODE"] = "disabled"
 
     wandb_logger = WandbLogger(
-        project="atmacup11",
-        name=f"exp001_resnet18d_reg_fold{fold}",
+        project=WANDB_PROJECT_NAME,
+        name=f"exp002_resnet18d_regnorm_fold{fold}",
         save_dir=str(output_dir),
     )
 
@@ -308,19 +347,20 @@ def train_one_fold(
     best_path = ckpt_cb.best_model_path
     LOGGER.info("Fold %d best checkpoint: %s", fold, best_path)
 
-    # === ベストcheckpointで valid を推論 ===
     preds_batches = trainer.predict(
         module, dataloaders=val_loader, ckpt_path=best_path)
-    preds = torch.cat(preds_batches, dim=0).cpu(
-    ).numpy().reshape(-1)   # ← このfoldの OOF 予測
+    preds = torch.cat(preds_batches, dim=0).cpu().numpy().reshape(-1)
 
     y_true = df_val["target"].values.astype(np.float32)
     rmse = float(np.sqrt(np.mean((preds - y_true) ** 2)))
     LOGGER.info("Fold %d RMSE (from best checkpoint): %.4f", fold, rmse)
 
-    # preds（=この fold の valid 行に対応する OOF）も返す
     return preds, rmse, best_path
 
+
+# ==============================
+# Test 推論
+# ==============================
 
 def predict_test(
     fold_to_ckpt: Dict[int, Path],
@@ -329,17 +369,18 @@ def predict_test(
     cfg: Config,
     accelerator: str,
     devices: Optional[int],
-    valid_tfm: T.Compose,
+    img_mean: List[float],
+    img_std: List[float],
 ) -> np.ndarray:
     """
-    学習済みの fold ごとの checkpoint から test を推論し、
-    fold 平均した予測ベクトルを返す（kamiさんの predict_test に相当）。
+    学習済み checkpoint 群から test を推論し、fold 平均した予測ベクトルを返す。
     """
-    # === test Dataset / DataLoader ===
     test_ds = AtmaDataset(
         meta_df=test_df.reset_index(drop=True),
-        images_root=photos_dir,
-        transform=valid_tfm,
+        photos_dir=photos_dir,
+        img_size=cfg.exp.img_size,
+        mean=img_mean,
+        std=img_std,
         is_train=False,
     )
     test_loader = DataLoader(
@@ -350,7 +391,6 @@ def predict_test(
         pin_memory=True,
     )
 
-    # 推論専用 Trainer（logger / checkpoint なし）
     trainer = pl.Trainer(
         accelerator=accelerator,
         devices=devices,
@@ -358,26 +398,24 @@ def predict_test(
         enable_checkpointing=False,
     )
 
-    fold_preds: list[np.ndarray] = []
+    fold_preds: List[np.ndarray] = []
 
     for fold, ckpt_path in fold_to_ckpt.items():
         LOGGER.info("Load checkpoint for fold %d: %s", fold, ckpt_path)
-
         module = RegressionModule.load_from_checkpoint(
             checkpoint_path=str(ckpt_path),
-            model_name=cfg.exp.model_name,
+            model_name=cfg.exp.model_name if hasattr(
+                cfg.exp, "model_name") else "resnet18d",
             learning_rate=cfg.exp.learning_rate,
             weight_decay=cfg.exp.weight_decay,
         )
-
         preds_batches = trainer.predict(module, dataloaders=test_loader)
         preds = torch.cat(preds_batches, dim=0).cpu().numpy().reshape(-1)
         LOGGER.info("Fold %d test preds shape: %s", fold, preds.shape)
         fold_preds.append(preds)
 
     if not fold_preds:
-        raise RuntimeError(
-            "No checkpoints found in fold_to_ckpt. Cannot predict test.")
+        raise RuntimeError("No checkpoints found. Cannot predict test.")
 
     if len(fold_preds) == 1:
         return fold_preds[0]
@@ -385,31 +423,38 @@ def predict_test(
         return np.mean(np.stack(fold_preds, axis=0), axis=0)
 
 
+# ==============================
+# main
+# ==============================
+
 @hydra.main(version_base=None, config_path=".", config_name="config")
 def main(cfg: Config) -> None:
     global LOGGER
 
-    # 実験名を Hydra の情報から決める
-    exp_name = f"{Path(__file__).parent.name}/{HydraConfig.get().runtime.choices.exp}"
-    output_dir = Path(cfg.env.exp_output_dir) / exp_name
-    os.makedirs(output_dir, exist_ok=True)
+    exp_name = f"{Path(sys.argv[0]).parent.name}/{HydraConfig.get().runtime.choices.exp}"
+    base_output_dir = Path(cfg.env.exp_output_dir)
+    output_dir = base_output_dir / exp_name
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ロガー設定
     LOGGER = get_logger(__name__, output_dir)
     LOGGER.info("Start experiment: %s", exp_name)
     LOGGER.info("Config:\n%s", OmegaConf.to_yaml(cfg))
 
-    # 乱数シード
     set_seed(cfg.exp.seed)
+    if torch.cuda.is_available():
+        # Tensor Core を使うための推奨設定
+        torch.set_float32_matmul_precision("high")
 
-    # データ読み込み
     input_dir = resolve_input_dir(cfg.env.input_dir)
+    photos_dir = input_dir / "photos"
     train_csv = input_dir / "train.csv"
     test_csv = input_dir / "test.csv"
+    sample_sub_path = input_dir / "atmaCup#11_sample_submission.csv"
 
     LOGGER.info("Input dir: %s", input_dir)
     LOGGER.info("Train CSV: %s", train_csv)
     LOGGER.info("Test  CSV: %s", test_csv)
+    LOGGER.info("Photos dir: %s", photos_dir)
 
     with trace("load_csv"):
         train_df = pd.read_csv(train_csv)
@@ -419,16 +464,40 @@ def main(cfg: Config) -> None:
     LOGGER.info("test_df  shape: %s", test_df.shape)
     LOGGER.info("train_df columns: %s", list(train_df.columns))
 
-    # ==============================
-    # Fold 作成 (StratifiedGroupKFold)
-    # ==============================
+    # 型をそろえる
+    train_df["object_id"] = train_df["object_id"].astype(str)
+    test_df["object_id"] = test_df["object_id"].astype(str)
+    train_df["art_series_id"] = train_df["art_series_id"].astype(str)
+    train_df["target"] = train_df["target"].astype(float)
+
+    # ==========
+    # mean/std 計算
+    # ==========
+    image_paths = [photos_dir /
+                   f"{oid}.jpg" for oid in train_df["object_id"].tolist()]
+
+    with trace("compute_mean_std"):
+        img_mean, img_std = compute_channel_mean_std(
+            image_paths=image_paths,
+            img_size=cfg.exp.img_size,
+            sample_limit=cfg.exp.mean_std_sample_limit,
+        )
+
+    LOGGER.info("Computed mean: %s", img_mean)
+    LOGGER.info("Computed std : %s", img_std)
+
+    # ==========
+    # StratifiedGroupKFold で fold 割り当て
+    # ==========
     LOGGER.info("Create folds with StratifiedGroupKFold")
 
     n_splits = 5
     sgkf = StratifiedGroupKFold(
-        n_splits=n_splits, shuffle=True, random_state=cfg.exp.seed)
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=cfg.exp.seed,
+    )
 
-    # y: target, groups: art_series_id
     y = train_df["target"].values
     groups = train_df["art_series_id"].values
     fold_indices = np.zeros(len(train_df), dtype=int)
@@ -443,22 +512,15 @@ def main(cfg: Config) -> None:
         "fold")["target"].value_counts().unstack().fillna(0)
     LOGGER.info("\n%s", fold_target_counts)
 
-    # ==============================
-    # Lightning で学習 (cfg.exp.folds に書かれた fold を順に学習)
-    # ==============================
-    photos_dir = input_dir / "photos"
-    LOGGER.info("Photos dir: %s", photos_dir)
-
-    train_tfm, valid_tfm = create_transforms(cfg.exp.img_size)
-
+    # ==========
+    # fold 学習 & OOF 作成
+    # ==========
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     LOGGER.info("Using device: %s", device_str)
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     devices: Optional[int] = 1 if torch.cuda.is_available() else None
 
-    # === fold ごとの学習 ===
     oof_pred = np.zeros(len(train_df), dtype=np.float32)
-
     fold_to_ckpt: Dict[int, Path] = {}
     fold_scores: Dict[int, float] = {}
 
@@ -473,11 +535,10 @@ def main(cfg: Config) -> None:
                 output_dir=output_dir,
                 accelerator=accelerator,
                 devices=devices,
-                train_tfm=train_tfm,
-                valid_tfm=valid_tfm,
+                img_mean=img_mean,
+                img_std=img_std,
             )
 
-        # この fold の valid 行に OOF を書き込む
         mask = train_df["fold"].values == fold
         oof_pred[mask] = oof_pred_fold
 
@@ -487,21 +548,14 @@ def main(cfg: Config) -> None:
 
     LOGGER.info("All folds training finished. Scores: %s", fold_scores)
 
-    # === OOF スコア計算 ===
+    # OOF スコア
     used_folds = cfg.exp.folds
-    mask_used = train_df["fold"].isin(used_folds).values  # 一応、使ったfoldだけ
+    mask_used = train_df["fold"].isin(used_folds).values
     y_true_all = train_df["target"].values.astype(np.float32)
-
     oof_rmse = float(
-        np.sqrt(np.mean((oof_pred[mask_used] - y_true_all[mask_used]) ** 2))
-    )
-    LOGGER.info(
-        "OOF RMSE (using folds=%s): %.4f",
-        used_folds,
-        oof_rmse,
-    )
+        np.sqrt(np.mean((oof_pred[mask_used] - y_true_all[mask_used]) ** 2)))
+    LOGGER.info("OOF RMSE (using folds=%s): %.4f", used_folds, oof_rmse)
 
-    # === OOF を CSV 保存 ===
     oof_df = pd.DataFrame(
         {
             "object_id": train_df["object_id"],
@@ -510,21 +564,20 @@ def main(cfg: Config) -> None:
             "oof_pred": oof_pred,
         }
     )
-    oof_path = output_dir / f"oof_resnet18d_exp001_{len(used_folds)}folds.csv"
+    oof_path = output_dir / f"oof_resnet18d_exp002_{len(used_folds)}folds.csv"
     oof_df.to_csv(oof_path, index=False)
     LOGGER.info("Saved OOF to %s", oof_path)
 
-    # ==============================
-    # Test 予測 ＋ submission 作成
-    # ==============================
-    sample_path = input_dir / "atmaCup#11_sample_submission.csv"
-    if not sample_path.exists():
-        LOGGER.error("Sample submission not found: %s", sample_path)
+    # ==========
+    # Test 推論 + submission
+    # ==========
+    if not sample_sub_path.exists():
+        LOGGER.error("Sample submission not found: %s", sample_sub_path)
         return
 
-    submission_df = pd.read_csv(sample_path)
+    submission_df = pd.read_csv(sample_sub_path)
     LOGGER.info("Loaded sample submission: %s (shape=%s)",
-                sample_path, submission_df.shape)
+                sample_sub_path, submission_df.shape)
 
     with trace("predict_test"):
         test_pred = predict_test(
@@ -534,7 +587,8 @@ def main(cfg: Config) -> None:
             cfg=cfg,
             accelerator=accelerator,
             devices=devices,
-            valid_tfm=valid_tfm,
+            img_mean=img_mean,
+            img_std=img_std,
         )
 
     if len(submission_df) != len(test_pred):
@@ -549,9 +603,10 @@ def main(cfg: Config) -> None:
         submission_df["target"] = test_pred
 
     sub_path = output_dir / \
-        f"submission_resnet18d_exp001_{len(fold_to_ckpt)}folds.csv"
+        f"submission_resnet18d_exp002_{len(fold_to_ckpt)}folds.csv"
     submission_df.to_csv(sub_path, index=False)
     LOGGER.info("Saved submission to %s", sub_path)
+    LOGGER.info("Done.")
 
 
 if __name__ == "__main__":
