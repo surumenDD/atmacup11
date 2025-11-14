@@ -24,7 +24,7 @@ exp:
   seed: 42
   learning_rate: 0.001
   batch_size: 64
-  epochs: 5         # 最初は軽め
+  epochs: 10         # 最初は軽め
   img_size: 224
   num_workers: 4
   weight_decay: 0.0
