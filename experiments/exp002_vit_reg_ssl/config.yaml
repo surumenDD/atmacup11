@@ -1,0 +1,35 @@
+
+defaults:
+  - _self_
+  - env: default
+  - exp: default
+  - override hydra/job_logging: none
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: False
+  run:
+    dir: .
+
+env:
+  input_dir: "./input"
+  output_dir: "./output"
+  exp_output_dir: "./output/experiments"
+
+exp:
+  debug: false
+  seed: 42
+  learning_rate: 0.0005         # ViT なので少し小さめ
+  batch_size: 32
+  epochs: 50
+  img_size: 224
+  num_workers: 4
+  weight_decay: 0.0
+  model_name: "vit_small_patch16_224"
+  folds: [0]
+  mean_std_sample_limit: 2000
+
+  # ★ SSL で pretrain した encoder の ckpt パス
+  # 実際のファイル名に合わせて後で書き換える
+  ssl_checkpoint_path: "/home/ryo52/LAIME/atmacup11_temp/output/experiments/exp001_vit_ssl_pretrain/default/encoder_ssl-100epoch.ckpt"
