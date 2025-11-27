@@ -1,0 +1,32 @@
+# experiments/exp001_resnet18d_reg/config.yaml
+defaults:
+  - _self_
+  - env: default
+  - exp: default
+  # hydra の自動ログディレクトリ作成を無効化
+  - override hydra/job_logging: none
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: False
+  run:
+    dir: .
+
+env:
+  # EnvConfig のデフォルトを上書きしたい場合はここに書く
+  input_dir: "./input"
+  output_dir: "./output"
+  exp_output_dir: "./output/experiments"
+
+exp:
+  debug: false
+  seed: 42
+  learning_rate: 0.001
+  batch_size: 64
+  epochs: 10         # 最初は軽め
+  img_size: 224
+  num_workers: 4
+  weight_decay: 0.0
+  model_name: "resnet18d"
+  folds: [0]        # まずは 1 fold だけ

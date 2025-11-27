@@ -42,7 +42,7 @@ class ExpConfig:
     seed: int = 42
     learning_rate: float = 1e-3
     batch_size: int = 64
-    epochs: int = 100
+    epochs: int = 2
     img_size: int = 224
     num_workers: int = 4
     weight_decay: float = 0.0

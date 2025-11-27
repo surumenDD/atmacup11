@@ -1,0 +1,31 @@
+# experiments/exp100_vit_ssl_pretrain/config.yaml
+defaults:
+  - _self_
+  - env: default
+  - exp: default
+  - override hydra/job_logging: none
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: False
+  run:
+    dir: .
+
+env:
+  input_dir: "./input"
+  output_dir: "./output"
+  exp_output_dir: "./output/experiments"
+
+exp:
+  debug: false
+  seed: 42
+  batch_size: 64
+  epochs: 50
+  img_size: 224
+  num_workers: 4
+  model_name: "vit_small_patch16_224"  # ★ pretrained=False で使う
+  proj_dim: 256        # projection head の次元
+  temperature: 0.1     # NT-Xent loss の温度
+  folds: [0]           # （SSL自体には使わないが型合わせのため残しておく）
+  mean_std_sample_limit: 2000  # 必要なら

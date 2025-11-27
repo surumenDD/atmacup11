@@ -1,0 +1,46 @@
+# experiments/exp007_dino_resnet18_reg/config.yaml
+defaults:
+  - _self_
+  - env: default
+  - exp: default
+  - override hydra/job_logging: none
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: False
+  run:
+    dir: .
+
+env:
+  input_dir: "./input"
+  output_dir: "./output"
+  exp_output_dir: "./output/experiments"
+
+exp:
+  debug: false
+  seed: 42
+  learning_rate: 0.0001
+  batch_size: 64
+  epochs: 10           # 必要なら増やす
+  img_size: 224
+  num_workers: 4
+  weight_decay: 0.0
+  folds: [0, 1, 2, 3, 4]
+
+  model_family: "dino"
+  backbone_name: "resnet18"
+  task: "reg"
+  num_classes: 4
+  freeze_backbone: false
+
+  dino_repo_dir: "./external/dino"
+  dino_checkpoint_path: "./output/dino_resnet18_ep800/checkpoint.pth"
+  dino_checkpoint_key: "teacher"
+  dino_patch_size: 16
+  dino_embed_dim_small: 384
+  dino_embed_dim_base: 768
+
+  mean_std_sample_limit: null
+  use_ema: true
+  ema_decay: 0.999
